@@ -43,6 +43,8 @@ class MotionMuxCore:
             raise ValueError('Velocity limits and timeouts must be finite and positive')
         self.mode = 'auto'
         self.reason = 'Navigation control'
+        self.control_rejected_reason = ''
+        self.control_received_count = 0
         self.source_id = None
         self.retired_sources = set()
         self.sequences = {}
@@ -173,25 +175,42 @@ class MotionMuxCore:
         /clock is paused because lease receipt is timed with monotonic time.
         """
         self._expire()
+        self.control_received_count += 1
         if not isinstance(payload, dict):
+            self.control_rejected_reason = 'control payload is not an object'
             return False
         source, seq, mode = (payload.get('source_id'), payload.get('seq'),
                              payload.get('mode'))
         stamp = payload.get('sent_at_ns')
-        if (not isinstance(source, str) or not source or len(source) > 128
-                or type(seq) is not int or seq < 0
-                or not isinstance(mode, str) or mode not in self.MODES
-                or (source in self.SAFETY_REASONS and mode != 'estop')
-                or type(stamp) is not int or stamp < 0
-                or type(ros_now_ns) is not int
-                or abs(ros_now_ns-stamp) > 1_000_000_000
-                or source in self.retired_sources
-                or seq <= self.sequences.get(source, -1)):
+        if not isinstance(source, str) or not source or len(source) > 128:
+            self.control_rejected_reason = 'invalid control source id'
+            return False
+        if type(seq) is not int or seq < 0:
+            self.control_rejected_reason = 'invalid control sequence'
+            return False
+        if not isinstance(mode, str) or mode not in self.MODES:
+            self.control_rejected_reason = 'invalid control mode'
+            return False
+        if source in self.SAFETY_REASONS and mode != 'estop':
+            self.control_rejected_reason = 'safety source may only send estop'
+            return False
+        if type(stamp) is not int or stamp < 0 or type(ros_now_ns) is not int:
+            self.control_rejected_reason = 'invalid control timestamp'
+            return False
+        if abs(ros_now_ns-stamp) > 1_000_000_000:
+            self.control_rejected_reason = 'control timestamp differs by more than 1 second'
+            return False
+        if source in self.retired_sources:
+            self.control_rejected_reason = 'control source has been retired'
+            return False
+        if seq <= self.sequences.get(source, -1):
+            self.control_rejected_reason = 'control sequence is replayed or out of order'
             return False
         try:
             velocity = self._velocity(payload.get('linear', 0.0),
                                       payload.get('angular', 0.0))
         except ValueError:
+            self.control_rejected_reason = 'control velocity is invalid'
             return False
         if source in self.SAFETY_REASONS:
             # Independent safety watchdogs can stop even a live manual lease.
@@ -201,12 +220,15 @@ class MotionMuxCore:
             self.estop_latched = True
             self.mode, self.reason = 'estop', self.SAFETY_REASONS[source]
             self.manual_velocity, self.auto_at = (0.0, 0.0), None
+            self.control_rejected_reason = ''
             return True
         if self.estop_latched and mode not in {'reset', 'estop'}:
+            self.control_rejected_reason = 'emergency stop is latched'
             return False
         now = self.clock()
         if (self.source_id is not None and source != self.source_id
                 and self.mode == 'manual' and mode != 'estop'):
+            self.control_rejected_reason = 'another source owns the manual lease'
             return False
         if source != self.source_id:
             # Service stop/reset must not permanently retire a connected UI.
@@ -216,6 +238,7 @@ class MotionMuxCore:
                 self.retired_sources.add(self.source_id)
             self.source_id = source
         self.sequences[source] = seq
+        self.control_rejected_reason = ''
 
         if mode == 'estop':
             self.estop_latched = True
@@ -286,6 +309,8 @@ class MotionMuxCore:
                 'source_id': self.source_id, 'estop_latched': self.estop_latched,
                 'auto_source_id': self.auto_source_id,
                 'auto_rejected_reason': self.auto_rejected_reason,
+                'control_rejected_reason': self.control_rejected_reason,
+                'control_received_count': self.control_received_count,
                 'output_owner': 'manual' if self.mode == 'manual' else self.mode,
                 'localization_speed_factor': factor,
                 'autonomous_allowed': auto_allowed,
@@ -507,6 +532,8 @@ class MotionMuxNode(Node):
         if self.core.receive_control(payload, self.get_clock().now().nanoseconds):
             self.publish_output()
             self.publish_status()
+        else:
+            self.publish_status()
 
     def publish_output(self):
         self.check_output_ownership()
@@ -557,6 +584,7 @@ class MotionMuxNode(Node):
         transition = (status['mode'], status['source_id'], status['estop_latched'],
                       status['reason'], self.output_available, self.output_conflict,
                       status['localization_speed_factor'], status['autonomous_allowed'],
+                      status['control_rejected_reason'], status['control_received_count'],
                       getattr(self, 'pending_reset', None) is not None)
         now = time.monotonic()
         if (not force and transition == getattr(self, '_status_transition', None)

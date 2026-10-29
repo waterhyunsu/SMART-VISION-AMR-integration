@@ -95,6 +95,16 @@ class MotionMuxTest(unittest.TestCase):
         self.assertFalse(self.control('estop', source='web-a'))
         self.assertEqual(self.mux.status()['source_id'], 'web-b')
 
+    def test_status_exposes_why_a_control_source_was_rejected(self):
+        self.assertTrue(self.control('hold', source='web-a'))
+        self.assertTrue(self.control('hold', source='web-b'))
+        self.assertFalse(self.control('hold', source='web-a'))
+        self.assertEqual(self.mux.status()['control_rejected_reason'],
+                         'control source has been retired')
+        self.assertEqual(self.mux.status()['control_received_count'], 3)
+        self.assertTrue(self.control('hold', source='web-b'))
+        self.assertEqual(self.mux.status()['control_rejected_reason'], '')
+
     def test_emergency_stop_can_preempt_another_bridge_manual_lease(self):
         self.control('manual', linear=.1)
         self.assertTrue(self.control('estop', source='web-b'))
